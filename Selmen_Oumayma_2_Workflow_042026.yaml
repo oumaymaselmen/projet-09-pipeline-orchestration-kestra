@@ -1,0 +1,498 @@
+id: bottleneck_pipeline
+namespace: bottleneck
+
+description: |
+  Pipeline automatisé BottleNeck — traitement des données vins.
+  Nettoyage SQL/DuckDB + Fusion + Calcul CA + Détection vins premium (z-score Python)
+
+inputs:
+  - id: erp_file
+    type: FILE
+    description: "Fichier ERP (erp.xlsx)"
+  - id: liaison_file
+    type: FILE
+    description: "Fichier de liaison (liaison.xlsx)"
+  - id: web_file
+    type: FILE
+    description: "Fichier WEB CMS (web.xlsx)"
+
+tasks:
+
+  - id: convert_to_csv
+    type: io.kestra.plugin.scripts.python.Script
+    taskRunner:
+      type: io.kestra.plugin.core.runner.Process
+    description: "Conversion des fichiers Excel en CSV pour DuckDB"
+    inputFiles:
+      erp.xlsx: "{{ inputs.erp_file }}"
+      liaison.xlsx: "{{ inputs.liaison_file }}"
+      web.xlsx: "{{ inputs.web_file }}"
+    outputFiles:
+      - erp_raw.csv
+      - liaison_raw.csv
+      - web_raw.csv
+    script: |
+      import pandas as pd
+      erp = pd.read_excel("erp.xlsx")
+      erp.to_csv("erp_raw.csv", index=False)
+      print(f"[CONVERT] ERP : {len(erp)} lignes")
+      liaison = pd.read_excel("liaison.xlsx")
+      liaison.to_csv("liaison_raw.csv", index=False)
+      print(f"[CONVERT] Liaison : {len(liaison)} lignes")
+      web = pd.read_excel("web.xlsx")
+      web.to_csv("web_raw.csv", index=False)
+      print(f"[CONVERT] WEB : {len(web)} lignes")
+    beforeCommands:
+      - pip install pandas openpyxl -q
+
+  - id: clean_erp
+    type: io.kestra.plugin.scripts.python.Script
+    taskRunner:
+      type: io.kestra.plugin.core.runner.Process
+    description: "Nettoyage ERP avec DuckDB SQL"
+    inputFiles:
+      erp_raw.csv: "{{ outputs.convert_to_csv.outputFiles['erp_raw.csv'] }}"
+    outputFiles:
+      - erp_clean.csv
+    script: |
+      import duckdb
+      con = duckdb.connect()
+      con.execute("""
+          CREATE TABLE erp_clean AS
+          SELECT DISTINCT * FROM read_csv_auto('erp_raw.csv')
+          WHERE product_id IS NOT NULL
+            AND price IS NOT NULL
+            AND stock_quantity IS NOT NULL
+            AND stock_status IS NOT NULL
+          QUALIFY ROW_NUMBER() OVER (PARTITION BY product_id ORDER BY product_id) = 1
+      """)
+      count = con.execute("SELECT COUNT(*) FROM erp_clean").fetchone()[0]
+      print(f"[ERP] Après nettoyage : {count} lignes")
+      con.execute("COPY erp_clean TO 'erp_clean.csv' (HEADER, DELIMITER ',')")
+      con.close()
+    beforeCommands:
+      - pip install duckdb -q
+
+  - id: test_clean_erp
+    type: io.kestra.plugin.scripts.python.Script
+    taskRunner:
+      type: io.kestra.plugin.core.runner.Process
+    description: "Test ERP : 825 lignes, 0 doublon"
+    inputFiles:
+      erp_clean.csv: "{{ outputs.clean_erp.outputFiles['erp_clean.csv'] }}"
+    script: |
+      import duckdb, sys
+      con = duckdb.connect()
+      con.execute("CREATE TABLE erp AS SELECT * FROM read_csv_auto('erp_clean.csv')")
+      errors = []
+      count = con.execute("SELECT COUNT(*) FROM erp").fetchone()[0]
+      if count != 825:
+          errors.append(f"ERREUR volumétrie ERP : attendu 825, obtenu {count}")
+      duplicates = con.execute("SELECT COUNT(*) - COUNT(DISTINCT product_id) FROM erp").fetchone()[0]
+      if duplicates > 0:
+          errors.append(f"ERREUR doublons ERP : {duplicates} trouvés")
+      con.close()
+      if errors:
+          for e in errors: print(e)
+          sys.exit(1)
+      print(f"[TEST ERP] OK — {count} lignes, 0 doublon")
+    beforeCommands:
+      - pip install duckdb -q
+
+  - id: clean_liaison
+    type: io.kestra.plugin.scripts.python.Script
+    taskRunner:
+      type: io.kestra.plugin.core.runner.Process
+    description: "Nettoyage liaison avec DuckDB SQL"
+    inputFiles:
+      liaison_raw.csv: "{{ outputs.convert_to_csv.outputFiles['liaison_raw.csv'] }}"
+    outputFiles:
+      - liaison_clean.csv
+    script: |
+      import duckdb
+      con = duckdb.connect()
+      con.execute("""
+          CREATE TABLE liaison_clean AS
+          SELECT DISTINCT
+              CAST(product_id AS INTEGER) AS product_id,
+              id_web
+          FROM read_csv_auto('liaison_raw.csv')
+          WHERE product_id IS NOT NULL
+          QUALIFY ROW_NUMBER() OVER (PARTITION BY product_id ORDER BY product_id) = 1
+      """)
+      count = con.execute("SELECT COUNT(*) FROM liaison_clean").fetchone()[0]
+      print(f"[LIAISON] Après dédoublonnage : {count} lignes")
+      con.execute("COPY liaison_clean TO 'liaison_clean.csv' (HEADER, DELIMITER ',')")
+      con.close()
+    beforeCommands:
+      - pip install duckdb -q
+
+  - id: test_clean_liaison
+    type: io.kestra.plugin.scripts.python.Script
+    taskRunner:
+      type: io.kestra.plugin.core.runner.Process
+    description: "Test liaison : 825 lignes, 0 doublon"
+    inputFiles:
+      liaison_clean.csv: "{{ outputs.clean_liaison.outputFiles['liaison_clean.csv'] }}"
+    script: |
+      import duckdb, sys
+      con = duckdb.connect()
+      con.execute("CREATE TABLE liaison AS SELECT * FROM read_csv_auto('liaison_clean.csv')")
+      errors = []
+      count = con.execute("SELECT COUNT(*) FROM liaison").fetchone()[0]
+      if count != 825:
+          errors.append(f"ERREUR volumétrie liaison : attendu 825, obtenu {count}")
+      duplicates = con.execute("SELECT COUNT(*) - COUNT(DISTINCT product_id) FROM liaison").fetchone()[0]
+      if duplicates > 0:
+          errors.append(f"ERREUR doublons liaison : {duplicates} trouvés")
+      con.close()
+      if errors:
+          for e in errors: print(e)
+          sys.exit(1)
+      print(f"[TEST LIAISON] OK — {count} lignes, 0 doublon")
+    beforeCommands:
+      - pip install duckdb -q
+
+  - id: clean_web
+    type: io.kestra.plugin.scripts.python.Script
+    taskRunner:
+      type: io.kestra.plugin.core.runner.Process
+    description: "Nettoyage WEB avec DuckDB SQL"
+    inputFiles:
+      web_raw.csv: "{{ outputs.convert_to_csv.outputFiles['web_raw.csv'] }}"
+    outputFiles:
+      - web_clean.csv
+    script: |
+      import duckdb
+      con = duckdb.connect()
+      con.execute("""
+          CREATE TABLE web_no_nan AS
+          SELECT * FROM read_csv_auto('web_raw.csv')
+          WHERE sku IS NOT NULL
+      """)
+      count_no_nan = con.execute("SELECT COUNT(*) FROM web_no_nan").fetchone()[0]
+      print(f"[WEB] Après suppression NaN sku : {count_no_nan} lignes")
+      con.execute("""
+          CREATE TABLE web_clean AS
+          SELECT DISTINCT *
+          FROM web_no_nan
+          QUALIFY ROW_NUMBER() OVER (PARTITION BY sku ORDER BY sku) = 1
+      """)
+      count = con.execute("SELECT COUNT(*) FROM web_clean").fetchone()[0]
+      print(f"[WEB] Après dédoublonnage : {count} lignes")
+      con.execute("COPY web_clean TO 'web_clean.csv' (HEADER, DELIMITER ',')")
+      con.close()
+    beforeCommands:
+      - pip install duckdb -q
+
+  - id: test_clean_web
+    type: io.kestra.plugin.scripts.python.Script
+    taskRunner:
+      type: io.kestra.plugin.core.runner.Process
+    description: "Test WEB : 0 doublon sur sku"
+    inputFiles:
+      web_clean.csv: "{{ outputs.clean_web.outputFiles['web_clean.csv'] }}"
+    script: |
+      import duckdb, sys
+      con = duckdb.connect()
+      con.execute("CREATE TABLE web AS SELECT * FROM read_csv_auto('web_clean.csv')")
+      errors = []
+      count = con.execute("SELECT COUNT(*) FROM web").fetchone()[0]
+      duplicates = con.execute("SELECT COUNT(*) - COUNT(DISTINCT sku) FROM web").fetchone()[0]
+      if duplicates > 0:
+          errors.append(f"ERREUR doublons WEB : {duplicates} trouvés")
+      con.close()
+      if errors:
+          for e in errors: print(e)
+          sys.exit(1)
+      print(f"[TEST WEB] OK — {count} lignes, 0 doublon")
+    beforeCommands:
+      - pip install duckdb -q
+
+  - id: merge_data
+    type: io.kestra.plugin.scripts.python.Script
+    taskRunner:
+      type: io.kestra.plugin.core.runner.Process
+    description: "Fusion ERP + liaison + WEB avec DuckDB SQL"
+    inputFiles:
+      erp_clean.csv: "{{ outputs.clean_erp.outputFiles['erp_clean.csv'] }}"
+      liaison_clean.csv: "{{ outputs.clean_liaison.outputFiles['liaison_clean.csv'] }}"
+      web_clean.csv: "{{ outputs.clean_web.outputFiles['web_clean.csv'] }}"
+    outputFiles:
+      - merged.csv
+    script: |
+      import duckdb
+      con = duckdb.connect()
+      con.execute("CREATE TABLE erp AS SELECT * FROM read_csv_auto('erp_clean.csv')")
+      con.execute("CREATE TABLE liaison AS SELECT * FROM read_csv_auto('liaison_clean.csv')")
+      con.execute("CREATE TABLE web AS SELECT * FROM read_csv_auto('web_clean.csv')")
+      con.execute("""
+          CREATE TABLE merged AS
+          SELECT
+              e.product_id,
+              e.price,
+              e.onsale_web,
+              e.stock_quantity,
+              e.stock_status,
+              w.post_title,
+              w.total_sales
+          FROM erp e
+          INNER JOIN liaison l ON e.product_id = l.product_id
+          INNER JOIN web w ON TRY_CAST(l.id_web AS INTEGER) = TRY_CAST(w.sku AS INTEGER)
+      """)
+      count = con.execute("SELECT COUNT(*) FROM merged").fetchone()[0]
+      print(f"[FUSION] Fichier fusionné : {count} lignes")
+      con.execute("COPY merged TO 'merged.csv' (HEADER, DELIMITER ',')")
+      con.close()
+    beforeCommands:
+      - pip install duckdb -q
+
+  - id: test_merge
+    type: io.kestra.plugin.scripts.python.Script
+    taskRunner:
+      type: io.kestra.plugin.core.runner.Process
+    description: "Test fusion : cohérence des jointures"
+    inputFiles:
+      merged.csv: "{{ outputs.merge_data.outputFiles['merged.csv'] }}"
+    script: |
+      import duckdb, sys
+      con = duckdb.connect()
+      con.execute("CREATE TABLE merged AS SELECT * FROM read_csv_auto('merged.csv')")
+      errors = []
+      count = con.execute("SELECT COUNT(*) FROM merged").fetchone()[0]
+      if count == 0:
+          errors.append("ERREUR : fichier fusionné vide")
+      nulls = con.execute("SELECT COUNT(*) FROM merged WHERE product_id IS NULL OR post_title IS NULL").fetchone()[0]
+      if nulls > 0:
+          errors.append(f"ERREUR : {nulls} valeurs manquantes")
+      con.close()
+      if errors:
+          for e in errors: print(e)
+          sys.exit(1)
+      print(f"[TEST FUSION] OK — {count} lignes, cohérence vérifiée")
+    beforeCommands:
+      - pip install duckdb -q
+
+  - id: compute_ca
+    type: io.kestra.plugin.scripts.python.Script
+    taskRunner:
+      type: io.kestra.plugin.core.runner.Process
+    description: "Calcul CA par produit et CA total avec DuckDB SQL"
+    inputFiles:
+      merged.csv: "{{ outputs.merge_data.outputFiles['merged.csv'] }}"
+    outputFiles:
+      - ca_report.csv
+    script: |
+      import duckdb
+      con = duckdb.connect()
+      con.execute("CREATE TABLE merged AS SELECT * FROM read_csv_auto('merged.csv')")
+      con.execute("""
+          CREATE TABLE ca_report AS
+          SELECT
+              product_id,
+              post_title AS nom_produit,
+              price AS prix_unitaire,
+              total_sales AS quantite_vendue,
+              ROUND(price * total_sales, 2) AS chiffre_affaires
+          FROM merged
+          ORDER BY chiffre_affaires DESC
+      """)
+      total = con.execute("SELECT ROUND(SUM(chiffre_affaires), 2) FROM ca_report").fetchone()[0]
+      count = con.execute("SELECT COUNT(*) FROM ca_report").fetchone()[0]
+      print(f"[CA] {count} produits — CA total : {total} €")
+      con.execute("COPY ca_report TO 'ca_report.csv' (HEADER, DELIMITER ',')")
+      con.close()
+    beforeCommands:
+      - pip install duckdb -q
+
+  - id: test_ca
+    type: io.kestra.plugin.scripts.python.Script
+    taskRunner:
+      type: io.kestra.plugin.core.runner.Process
+    description: "Test CA : cohérence des montants"
+    inputFiles:
+      ca_report.csv: "{{ outputs.compute_ca.outputFiles['ca_report.csv'] }}"
+    script: |
+      import duckdb, sys
+      con = duckdb.connect()
+      con.execute("CREATE TABLE ca AS SELECT * FROM read_csv_auto('ca_report.csv')")
+      errors = []
+      total = con.execute("SELECT SUM(chiffre_affaires) FROM ca").fetchone()[0]
+      nulls = con.execute("SELECT COUNT(*) FROM ca WHERE chiffre_affaires IS NULL").fetchone()[0]
+      if total <= 0:
+          errors.append(f"ERREUR CA invalide : {total} €")
+      if nulls > 0:
+          errors.append(f"ERREUR : {nulls} valeurs CA manquantes")
+      con.close()
+      if errors:
+          for e in errors: print(e)
+          sys.exit(1)
+      print(f"[TEST CA] OK — CA total = {total:.2f} €")
+    beforeCommands:
+      - pip install duckdb -q
+
+  - id: detect_wines
+    type: io.kestra.plugin.scripts.python.Script
+    taskRunner:
+      type: io.kestra.plugin.core.runner.Process
+    description: "Détection vins premium via z-score Python (z > 2)"
+    inputFiles:
+      merged.csv: "{{ outputs.merge_data.outputFiles['merged.csv'] }}"
+      ca_report.csv: "{{ outputs.compute_ca.outputFiles['ca_report.csv'] }}"
+    outputFiles:
+      - vins_premium.csv
+      - vins_ordinaires.csv
+    script: |
+      import pandas as pd
+      import numpy as np
+      df = pd.read_csv("merged.csv")
+      ca = pd.read_csv("ca_report.csv")
+      mean_price = df['price'].mean()
+      std_price = df['price'].std()
+      df['z_score'] = (df['price'] - mean_price) / std_price
+      print(f"[Z-SCORE] z = (prix - {mean_price:.2f}) / {std_price:.2f}")
+      df = df.merge(ca[['product_id', 'chiffre_affaires']], on='product_id', how='left')
+      cols = ['product_id', 'post_title', 'price', 'total_sales', 'chiffre_affaires', 'z_score']
+      premium = df[df['z_score'] > 2][cols].copy()
+      premium.columns = ['product_id', 'nom_produit', 'prix_unitaire', 'quantite_vendue', 'chiffre_affaires', 'z_score']
+      ordinaires = df[df['z_score'] <= 2][cols].copy()
+      ordinaires.columns = ['product_id', 'nom_produit', 'prix_unitaire', 'quantite_vendue', 'chiffre_affaires', 'z_score']
+      premium.to_csv("vins_premium.csv", index=False)
+      ordinaires.to_csv("vins_ordinaires.csv", index=False)
+      print(f"[Z-SCORE] Premium : {len(premium)} — Ordinaires : {len(ordinaires)}")
+    beforeCommands:
+      - pip install pandas numpy -q
+
+  - id: test_zscore
+    type: io.kestra.plugin.scripts.python.Script
+    taskRunner:
+      type: io.kestra.plugin.core.runner.Process
+    description: "Test z-score : 30 vins premium attendus"
+    inputFiles:
+      vins_premium.csv: "{{ outputs.detect_wines.outputFiles['vins_premium.csv'] }}"
+      vins_ordinaires.csv: "{{ outputs.detect_wines.outputFiles['vins_ordinaires.csv'] }}"
+    script: |
+      import pandas as pd, sys
+      premium = pd.read_csv("vins_premium.csv")
+      ordinaires = pd.read_csv("vins_ordinaires.csv")
+      errors = []
+      if len(premium) != 30:
+          errors.append(f"ERREUR premium : attendu 30, obtenu {len(premium)}")
+      if (premium['z_score'] <= 2).any():
+          errors.append("ERREUR : des vins premium ont z_score <= 2")
+      if (ordinaires['z_score'] > 2).any():
+          errors.append("ERREUR : des vins ordinaires ont z_score > 2")
+      if errors:
+          for e in errors: print(e)
+          sys.exit(1)
+      print(f"[TEST Z-SCORE] OK — {len(premium)} premium, {len(ordinaires)} ordinaires")
+    beforeCommands:
+      - pip install pandas -q
+
+  - id: export_ca_xlsx
+    type: io.kestra.plugin.scripts.python.Script
+    taskRunner:
+      type: io.kestra.plugin.core.runner.Process
+    description: "Export rapport CA en .xlsx"
+    inputFiles:
+      ca_report.csv: "{{ outputs.compute_ca.outputFiles['ca_report.csv'] }}"
+    outputFiles:
+      - rapport_ca_bottleneck.xlsx
+    script: |
+      import pandas as pd
+      from openpyxl import Workbook
+      from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
+      df = pd.read_csv("ca_report.csv")
+      total_ca = df['chiffre_affaires'].sum()
+      wb = Workbook()
+      ws = wb.active
+      ws.title = "Rapport CA BottleNeck"
+      header_fill = PatternFill("solid", fgColor="1F3864")
+      header_font = Font(color="FFFFFF", bold=True, size=11)
+      border = Border(left=Side(style='thin'), right=Side(style='thin'),
+                      top=Side(style='thin'), bottom=Side(style='thin'))
+      headers = ['ID Produit', 'Nom du produit', 'Prix unitaire (€)', 'Quantité vendue', "Chiffre d'affaires (€)"]
+      for col, h in enumerate(headers, 1):
+          cell = ws.cell(row=1, column=col, value=h)
+          cell.fill = header_fill
+          cell.font = header_font
+          cell.alignment = Alignment(horizontal='center')
+          cell.border = border
+      alt_fill = PatternFill("solid", fgColor="DCE6F1")
+      for row_idx, row in enumerate(df.itertuples(), 2):
+          fill = alt_fill if row_idx % 2 == 0 else PatternFill("solid", fgColor="FFFFFF")
+          values = [row.product_id, row.nom_produit, row.prix_unitaire, row.quantite_vendue, row.chiffre_affaires]
+          for col, val in enumerate(values, 1):
+              cell = ws.cell(row=row_idx, column=col, value=val)
+              cell.fill = fill
+              cell.border = border
+              if col in [3, 5]:
+                  cell.number_format = '#,##0.00 €'
+      total_row = len(df) + 2
+      total_fill = PatternFill("solid", fgColor="2E75B6")
+      total_font = Font(color="FFFFFF", bold=True)
+      ws.cell(row=total_row, column=1, value="TOTAL").fill = total_fill
+      ws.cell(row=total_row, column=1).font = total_font
+      for col in range(2, 6):
+          ws.cell(row=total_row, column=col).fill = total_fill
+      total_cell = ws.cell(row=total_row, column=5, value=total_ca)
+      total_cell.fill = total_fill
+      total_cell.font = total_font
+      total_cell.number_format = '#,##0.00 €'
+      ws.column_dimensions['A'].width = 12
+      ws.column_dimensions['B'].width = 50
+      ws.column_dimensions['C'].width = 20
+      ws.column_dimensions['D'].width = 18
+      ws.column_dimensions['E'].width = 25
+      wb.save("rapport_ca_bottleneck.xlsx")
+      print(f"[EXPORT] rapport_ca_bottleneck.xlsx — CA total = {total_ca:.2f} €")
+    beforeCommands:
+      - pip install pandas openpyxl -q
+
+  - id: export_branches
+    type: io.kestra.plugin.core.flow.Parallel
+    description: "Export en parallèle vins premium et ordinaires"
+    tasks:
+      - id: export_premium_csv
+        type: io.kestra.plugin.scripts.python.Script
+        taskRunner:
+          type: io.kestra.plugin.core.runner.Process
+        description: "Export vins premium en .csv"
+        inputFiles:
+          vins_premium.csv: "{{ outputs.detect_wines.outputFiles['vins_premium.csv'] }}"
+        outputFiles:
+          - vins_premium_export.csv
+        script: |
+          import pandas as pd
+          df = pd.read_csv("vins_premium.csv")
+          df.to_csv("vins_premium_export.csv", index=False, encoding='utf-8-sig')
+          print(f"[EXPORT] {len(df)} vins premium exportés")
+        beforeCommands:
+          - pip install pandas -q
+
+      - id: export_ordinaires_csv
+        type: io.kestra.plugin.scripts.python.Script
+        taskRunner:
+          type: io.kestra.plugin.core.runner.Process
+        description: "Export vins ordinaires en .csv"
+        inputFiles:
+          vins_ordinaires.csv: "{{ outputs.detect_wines.outputFiles['vins_ordinaires.csv'] }}"
+        outputFiles:
+          - vins_ordinaires_export.csv
+        script: |
+          import pandas as pd
+          df = pd.read_csv("vins_ordinaires.csv")
+          df.to_csv("vins_ordinaires_export.csv", index=False, encoding='utf-8-sig')
+          print(f"[EXPORT] {len(df)} vins ordinaires exportés")
+        beforeCommands:
+          - pip install pandas -q
+
+triggers:
+  - id: monthly_schedule
+    type: io.kestra.plugin.core.trigger.Schedule
+    cron: "0 9 15 * *"
+
+errors:
+  - id: error_notification
+    type: io.kestra.plugin.core.log.Log
+    message: "ALERTE — Échec du workflow BottleNeck. Tâche en erreur : {{ task.id }}"
