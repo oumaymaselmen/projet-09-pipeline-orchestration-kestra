@@ -29,5 +29,7 @@ Mettre en place un pipeline d'orchestration des flux de donnees pour BottleNeck,
 - Chiffre d'affaires total : 65 402 euros
 - 30 vins premium identifies par score z
 
+## Résultats
+    712 produits analysés, CA de 65 402 €, 30 vins premium identifiés par z-score
 ---
 Formation Data Engineer - OpenClassrooms
